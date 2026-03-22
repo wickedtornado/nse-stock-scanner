@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 """
-NSE Stock Analyser — Angel One SmartAPI + Telegram Alerts
-Runs via Render.com cron job daily at 9:15 AM IST.
-Credentials stored as Render Environment Variables.
+NSE Stock Analyser — Yahoo Finance + Telegram Alerts
+Runs via Render.com cron job daily at 9:15 AM IST (03:45 UTC).
+No IP restrictions. Credentials via Render Environment Variables.
 """
 
 import os
 import sys
-import time
-import pyotp
 import requests
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from datetime import datetime, timedelta
-from SmartApi import SmartConnect
 
 # ──────────────────────────────────────────────
 # CREDENTIALS — from Render Environment Variables
 # ──────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-ANGEL_API_KEY      = os.environ.get("ANGEL_API_KEY", "")
-ANGEL_CLIENT_ID    = os.environ.get("ANGEL_CLIENT_ID", "")
-ANGEL_PASSWORD     = os.environ.get("ANGEL_PASSWORD", "")
-ANGEL_TOTP_SECRET  = os.environ.get("ANGEL_TOTP_SECRET", "")
 
 # ──────────────────────────────────────────────
 # CONFIG
@@ -34,71 +28,43 @@ MAX_OUTPUT     = 8        # max recommendations per run
 MIN_AVG_VOLUME = 500_000  # filter illiquid stocks
 
 # ──────────────────────────────────────────────
-# NSE SYMBOL → Angel One Token MAP
+# NSE WATCHLIST — Top 80 liquid stocks
 # ──────────────────────────────────────────────
-WATCHLIST = {
-    "RELIANCE":    "2885",  "TCS":         "11536", "HDFCBANK":    "1333",
-    "INFY":        "1594",  "ICICIBANK":   "4963",  "HINDUNILVR":  "1394",
-    "SBIN":        "3045",  "BHARTIARTL":  "10604", "ITC":         "1660",
-    "KOTAKBANK":   "1922",  "LT":          "11483", "AXISBANK":    "5900",
-    "ASIANPAINT":  "236",   "MARUTI":      "10999", "TITAN":       "3506",
-    "SUNPHARMA":   "3351",  "WIPRO":       "3787",  "HCLTECH":     "7229",
-    "TECHM":       "13538", "BAJFINANCE":  "317",   "BAJAJFINSV":  "16675",
-    "TATAMOTORS":  "3456",  "TATASTEEL":   "3499",  "JSWSTEEL":    "11723",
-    "HINDALCO":    "1363",  "NTPC":        "11630", "POWERGRID":   "14977",
-    "ONGC":        "2475",  "COALINDIA":   "20374", "GRASIM":      "1232",
-    "DRREDDY":     "881",   "CIPLA":       "694",   "DIVISLAB":    "10940",
-    "EICHERMOT":   "910",   "BPCL":        "526",   "M&M":         "2031",
-    "HEROMOTOCO":  "1348",  "INDUSINDBK":  "5258",  "ADANIPORTS":  "15083",
-    "APOLLOHOSP":  "157",   "BRITANNIA":   "547",   "TATACONSUM":  "3432",
-    "HAVELLS":     "2182",  "PIDILITIND":  "2664",  "DMART":       "13375",
-    "SBILIFE":     "21808", "HDFCLIFE":    "467",   "ICICIGI":     "15044",
-    "VEDL":        "3063",  "BANKBARODA":  "4668",  "CANBK":       "2763",
-    "GAIL":        "1107",  "IOC":         "1624",  "TATAPOWER":   "3426",
-    "TORNTPHARM":  "3518",  "LUPIN":       "10440", "BAJAJ-AUTO":  "16669",
-    "NAUKRI":      "13751", "PERSISTENT":  "18365", "MPHASIS":     "4503",
-    "COFORGE":     "11543", "CHOLAFIN":    "685",   "FEDERALBNK":  "1023",
-    "IDFCFIRSTB":  "11957", "VOLTAS":      "3718",  "GODREJCP":    "10099",
-    "MARICO":      "4067",  "COLPAL":      "1406",  "DABUR":       "772",
-    "BERGEPAINT":  "404",   "ZOMATO":      "21296", "IRCTC":       "13611",
-    "ADANIENT":    "25",    "DLF":         "14732", "GODREJPROP":  "10147",
-    "OBEROIRLTY":  "20242", "MUTHOOTFIN":  "17971", "SBICARD":     "317",
-    "PIIND":       "2662",  "ALKEM":       "13220", "AUROPHARMA":  "275",
-}
+WATCHLIST = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+    "HINDUNILVR.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "KOTAKBANK.NS",
+    "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "TITAN.NS",
+    "SUNPHARMA.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS", "BAJFINANCE.NS",
+    "BAJAJFINSV.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "JSWSTEEL.NS", "HINDALCO.NS",
+    "NTPC.NS", "POWERGRID.NS", "ONGC.NS", "COALINDIA.NS", "GRASIM.NS",
+    "DRREDDY.NS", "CIPLA.NS", "DIVISLAB.NS", "EICHERMOT.NS", "BPCL.NS",
+    "M&M.NS", "HEROMOTOCO.NS", "INDUSINDBK.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS",
+    "BRITANNIA.NS", "TATACONSUM.NS", "HAVELLS.NS", "PIDILITIND.NS", "DMART.NS",
+    "SBILIFE.NS", "HDFCLIFE.NS", "ICICIGI.NS", "VEDL.NS", "BANKBARODA.NS",
+    "CANBK.NS", "GAIL.NS", "IOC.NS", "TATAPOWER.NS", "TORNTPHARM.NS",
+    "LUPIN.NS", "BAJAJ-AUTO.NS", "NAUKRI.NS", "PERSISTENT.NS", "MPHASIS.NS",
+    "COFORGE.NS", "CHOLAFIN.NS", "FEDERALBNK.NS", "IDFCFIRSTB.NS", "VOLTAS.NS",
+    "GODREJCP.NS", "MARICO.NS", "COLPAL.NS", "DABUR.NS", "BERGEPAINT.NS",
+    "ZOMATO.NS", "IRCTC.NS", "ADANIENT.NS", "DLF.NS", "GODREJPROP.NS",
+    "OBEROIRLTY.NS", "MUTHOOTFIN.NS", "PIIND.NS", "ALKEM.NS", "AUROPHARMA.NS",
+]
 
 # ──────────────────────────────────────────────
-# ANGEL ONE LOGIN
+# DATA FETCHING — Yahoo Finance
 # ──────────────────────────────────────────────
-def angel_login():
-    totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
-    obj  = SmartConnect(api_key=ANGEL_API_KEY)
-    data = obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PASSWORD, totp)
-    if not data or data.get("status") is False:
-        raise Exception(f"Login failed: {data.get('message', 'Unknown error')}")
-    print("✅ Angel One login successful")
-    return obj
-
-def fetch_historical(obj, token: str, symbol: str):
+def fetch_data(ticker: str):
     try:
-        now       = datetime.now()
-        to_date   = now.strftime("%Y-%m-%d %H:%M")
-        from_date = (now - timedelta(days=120)).strftime("%Y-%m-%d %H:%M")
-        params = {
-            "exchange":    "NSE",
-            "symboltoken": token,
-            "interval":    "ONE_DAY",
-            "fromdate":    from_date,
-            "todate":      to_date,
-        }
-        resp = obj.getCandleData(params)
-        if not resp or resp.get("status") is False or not resp.get("data"):
+        df = yf.download(ticker, period="3mo", interval="1d",
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 30:
             return None
-        df = pd.DataFrame(resp["data"], columns=["timestamp","open","high","low","close","volume"])
-        df["close"]  = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
-        return df if len(df) >= 30 else None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df["Close"]  = df["Close"].astype(float)
+        df["Volume"] = df["Volume"].astype(float)
+        return df
     except Exception as e:
-        print(f"  ⚠️  {symbol}: {e}")
+        print(f"  ⚠️  {ticker}: {e}")
         return None
 
 # ──────────────────────────────────────────────
@@ -137,16 +103,17 @@ def calc_vol_spike(vol: pd.Series) -> float:
 # ──────────────────────────────────────────────
 # ANALYSIS ENGINE
 # ──────────────────────────────────────────────
-def analyse(symbol: str, df: pd.DataFrame):
-    close  = df["close"]
-    volume = df["volume"]
+def analyse(ticker: str, df: pd.DataFrame):
+    close  = df["Close"]
+    volume = df["Volume"]
+    symbol = ticker.replace(".NS", "").replace(".BO", "")
 
     if volume.iloc[-20:].mean() < MIN_AVG_VOLUME:
         return None
 
-    price    = round(float(close.iloc[-1]), 2)
-    prev     = round(float(close.iloc[-2]), 2)
-    day_chg  = round((price - prev) / prev * 100, 2)
+    price   = round(float(close.iloc[-1]), 2)
+    prev    = round(float(close.iloc[-2]), 2)
+    day_chg = round((price - prev) / prev * 100, 2)
 
     rsi_val                  = calc_rsi(close)
     macd_val, sig_val, hist  = calc_macd(close)
@@ -232,9 +199,7 @@ def send_telegram(message: str):
 
 def build_message(results: list) -> str:
     now  = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    hour = datetime.now().hour
-    scan = "🌅 Morning" if hour < 12 else "🌆 End-of-Day"
-    lines = [f"📊 <b>{scan} Stock Scan</b>", f"🕐 {now} IST\n"]
+    lines = [f"📊 <b>NSE Morning Scan</b>", f"🕐 {now} IST\n"]
 
     buys   = [r for r in results if r["signal"] == "BUY"]
     shorts = [r for r in results if r["signal"] == "SHORT"]
@@ -276,38 +241,19 @@ def main():
     print(f"{'═'*55}\n")
 
     # Validate credentials
-    missing = [k for k, v in {
-        "ANGEL_API_KEY": ANGEL_API_KEY,
-        "ANGEL_CLIENT_ID": ANGEL_CLIENT_ID,
-        "ANGEL_PASSWORD": ANGEL_PASSWORD,
-        "ANGEL_TOTP_SECRET": ANGEL_TOTP_SECRET,
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-    }.items() if not v]
-
-    if missing:
-        print(f"❌ Missing environment variables: {', '.join(missing)}")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         sys.exit(1)
 
-    # Login
-    try:
-        obj = angel_login()
-    except Exception as e:
-        msg = f"❌ Angel One login failed: {e}"
-        print(msg)
-        send_telegram(f"🚨 <b>Stock Scanner Error</b>\n{msg}")
-        sys.exit(1)
-
-    # Scan
+    # Scan all stocks
     results = []
     total   = len(WATCHLIST)
-    for i, (symbol, token) in enumerate(WATCHLIST.items()):
-        df = fetch_historical(obj, token, symbol)
+    for i, ticker in enumerate(WATCHLIST):
+        df = fetch_data(ticker)
         if df is not None:
-            rec = analyse(symbol, df)
+            rec = analyse(ticker, df)
             if rec:
                 results.append(rec)
-        time.sleep(0.4)  # avoid Angel One rate limiting
         if (i + 1) % 20 == 0:
             print(f"  {i+1}/{total} scanned — {len(results)} signals so far")
 
@@ -318,10 +264,10 @@ def main():
 
     if not final:
         print("\n😐 No strong signals today.")
-        send_telegram("📊 <b>Stock Scan Complete</b>\n\nNo strong signals today. Market is ranging. Stay patient. 💤")
+        send_telegram("📊 <b>NSE Scan Complete</b>\n\nNo strong signals today. Market is ranging. Stay patient. 💤")
         return
 
-    # Print to console (visible in Render logs)
+    # Print to Render logs
     print(f"\n{'─'*55}")
     for r in final:
         icon = "🟢" if r["signal"] == "BUY" else "🔴"
