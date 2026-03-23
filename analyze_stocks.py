@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-NSE Stock Analyser — Yahoo Finance + Telegram Alerts
-Runs via Render.com cron job daily at 9:15 AM IST (03:45 UTC).
-No IP restrictions. Credentials via Render Environment Variables.
+NSE Stock Analyser v2 — Yahoo Finance + Telegram Alerts
+Improvements over v1:
+  - 200 EMA trend filter: no BUY in strong downtrend
+  - Market mood check via Nifty 50
+  - Volume confirmation mandatory for BUY
+  - Higher BUY threshold: score >= 60 (was 45)
+  - Stronger downtrend penalty to avoid falling knife traps
 """
 
 import os
@@ -11,10 +15,10 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ──────────────────────────────────────────────
-# CREDENTIALS — from Render Environment Variables
+# CREDENTIALS — Render Environment Variables
 # ──────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -22,13 +26,15 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
-MIN_PROFIT_PCT = 1.0      # target exactly 1%
-STOP_LOSS_PCT  = 0.5      # stop-loss 0.5%
-MAX_OUTPUT     = 8        # max recommendations per run
-MIN_AVG_VOLUME = 500_000  # filter illiquid stocks
+MIN_PROFIT_PCT  = 1.0
+STOP_LOSS_PCT   = 0.5
+MAX_OUTPUT      = 6
+MIN_AVG_VOLUME  = 500_000
+BUY_THRESHOLD   = 60     # raised from 45
+SHORT_THRESHOLD = -25
 
 # ──────────────────────────────────────────────
-# NSE WATCHLIST — Top 80 liquid stocks
+# NSE WATCHLIST
 # ──────────────────────────────────────────────
 WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
@@ -50,13 +56,13 @@ WATCHLIST = [
 ]
 
 # ──────────────────────────────────────────────
-# DATA FETCHING — Yahoo Finance
+# DATA FETCHING — 1 year for 200 EMA accuracy
 # ──────────────────────────────────────────────
-def fetch_data(ticker: str):
+def fetch_data(ticker: str, period="1y"):
     try:
-        df = yf.download(ticker, period="3mo", interval="1d",
+        df = yf.download(ticker, period=period, interval="1d",
                          progress=False, auto_adjust=True)
-        if df is None or len(df) < 30:
+        if df is None or len(df) < 50:
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -68,7 +74,29 @@ def fetch_data(ticker: str):
         return None
 
 # ──────────────────────────────────────────────
-# TECHNICAL INDICATORS
+# MARKET MOOD — Nifty 50 trend check
+# ──────────────────────────────────────────────
+def get_market_mood() -> str:
+    try:
+        df = fetch_data("^NSEI", period="3mo")
+        if df is None:
+            return "NEUTRAL"
+        close   = df["Close"]
+        ema20   = close.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50   = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        price   = float(close.iloc[-1])
+        prev    = float(close.iloc[-2])
+        day_chg = (price - prev) / prev * 100
+        if price > ema20 > ema50 and day_chg > -0.5:
+            return "BULLISH"
+        elif price < ema20 < ema50 and day_chg < 0.5:
+            return "BEARISH"
+        return "NEUTRAL"
+    except:
+        return "NEUTRAL"
+
+# ──────────────────────────────────────────────
+# INDICATORS
 # ──────────────────────────────────────────────
 def calc_rsi(series: pd.Series, period=14) -> float:
     delta = series.diff()
@@ -103,7 +131,7 @@ def calc_vol_spike(vol: pd.Series) -> float:
 # ──────────────────────────────────────────────
 # ANALYSIS ENGINE
 # ──────────────────────────────────────────────
-def analyse(ticker: str, df: pd.DataFrame):
+def analyse(ticker: str, df: pd.DataFrame, market_mood: str):
     close  = df["Close"]
     volume = df["Volume"]
     symbol = ticker.replace(".NS", "").replace(".BO", "")
@@ -120,7 +148,12 @@ def analyse(ticker: str, df: pd.DataFrame):
     bb_upper, bb_lower, pctb = calc_bollinger(close)
     ema9                     = calc_ema(close, 9)
     ema21                    = calc_ema(close, 21)
+    ema200                   = calc_ema(close, 200)
     vspike                   = calc_vol_spike(volume)
+
+    above_200ema = price > ema200
+    pct_from_200 = round((price - ema200) / ema200 * 100, 2)
+    deep_downtrend = pct_from_200 < -15
 
     score   = 0
     reasons = []
@@ -145,21 +178,41 @@ def analyse(ticker: str, df: pd.DataFrame):
     elif pctb > 0.85:
         score -= 10; reasons.append("Near upper Bollinger Band")
 
-    # EMA trend
+    # EMA short-term trend
     if price > ema9 > ema21:
         score += 15; reasons.append("Uptrend: price > EMA9 > EMA21")
     elif price < ema9 < ema21:
-        score -= 10; reasons.append("Downtrend: price < EMA9 < EMA21")
+        score -= 20; reasons.append("Downtrend: price < EMA9 < EMA21")
 
-    # Volume
-    if vspike > 1.5:
-        score += 10; reasons.append(f"Volume spike {vspike}x")
+    # 200 EMA long-term trend — KEY NEW FILTER
+    if above_200ema:
+        score += 15; reasons.append(f"Above 200 EMA (+{pct_from_200}%)")
+    elif deep_downtrend:
+        score -= 25; reasons.append(f"Deep downtrend ({pct_from_200}% below 200 EMA)")
+    else:
+        score -= 10; reasons.append(f"Below 200 EMA ({pct_from_200}%)")
 
-    if score >= 45:
+    # Volume — mandatory confirmation
+    if vspike >= 1.5:
+        score += 15; reasons.append(f"Volume confirmed {vspike}x avg")
+    elif vspike < 1.0:
+        score -= 10; reasons.append(f"Volume weak ({vspike}x avg)")
+
+    # Market mood adjustment
+    if market_mood == "BEARISH":
+        score -= 15
+        reasons.append("⚠️ Bearish Nifty — lower confidence")
+    elif market_mood == "BULLISH":
+        score += 10
+
+    # Decision
+    if score >= BUY_THRESHOLD:
+        if deep_downtrend and market_mood != "BULLISH":
+            return None  # hard block: never BUY deep downtrend
         signal = "BUY"
         target = round(price * (1 + MIN_PROFIT_PCT / 100), 2)
         sl     = round(price * (1 - STOP_LOSS_PCT / 100), 2)
-    elif score <= -20:
+    elif score <= SHORT_THRESHOLD:
         signal = "SHORT"
         target = round(price * (1 - MIN_PROFIT_PCT / 100), 2)
         sl     = round(price * (1 + STOP_LOSS_PCT / 100), 2)
@@ -176,6 +229,7 @@ def analyse(ticker: str, df: pd.DataFrame):
         "rsi":     rsi_val,
         "vol":     vspike,
         "day_chg": day_chg,
+        "vs200":   pct_from_200,
         "reasons": reasons,
     }
 
@@ -197,9 +251,14 @@ def send_telegram(message: str):
     else:
         print(f"❌ Telegram error: {r.text}")
 
-def build_message(results: list) -> str:
-    now  = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    lines = [f"📊 <b>NSE Morning Scan</b>", f"🕐 {now} IST\n"]
+def build_message(results: list, market_mood: str) -> str:
+    now       = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    mood_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(market_mood, "🟡")
+    lines = [
+        f"📊 <b>NSE Evening Scan</b>",
+        f"🕐 {now} IST",
+        f"🌍 Market: {mood_icon} {market_mood}\n"
+    ]
 
     buys   = [r for r in results if r["signal"] == "BUY"]
     shorts = [r for r in results if r["signal"] == "SHORT"]
@@ -212,8 +271,8 @@ def build_message(results: list) -> str:
                 f"  💰 Entry: ₹{r['price']}\n"
                 f"  🎯 Target: ₹{r['target']}  (+1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (-0.5%)\n"
-                f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  Day: {r['day_chg']}%\n"
-                f"  📝 {' • '.join(r['reasons'][:2])}"
+                f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  vs200EMA: {r['vs200']}%\n"
+                f"  📝 {' • '.join(r['reasons'][:3])}"
             )
 
     if shorts:
@@ -224,10 +283,13 @@ def build_message(results: list) -> str:
                 f"  💰 Entry: ₹{r['price']}\n"
                 f"  🎯 Target: ₹{r['target']}  (-1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (+0.5%)\n"
-                f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  Day: {r['day_chg']}%\n"
-                f"  📝 {' • '.join(r['reasons'][:2])}\n"
-                f"  📦 Use: Futures or Put Option"
+                f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  vs200EMA: {r['vs200']}%\n"
+                f"  📝 {' • '.join(r['reasons'][:3])}\n"
+                f"  📦 Instrument: Futures or Put Option"
             )
+
+    if not buys and not shorts:
+        lines.append("😐 No strong signals today. Stay patient, don't force trades.")
 
     lines.append("\n⚠️ <i>Educational only. Not SEBI-registered advice. Always set SL.</i>")
     return "\n".join(lines)
@@ -237,46 +299,45 @@ def build_message(results: list) -> str:
 # ──────────────────────────────────────────────
 def main():
     print(f"\n{'═'*55}")
-    print(f"  NSE Stock Scanner — {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+    print(f"  NSE Stock Scanner v2 — {datetime.now().strftime('%d %b %Y %I:%M %p')}")
     print(f"{'═'*55}\n")
 
-    # Validate credentials
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         sys.exit(1)
 
-    # Scan all stocks
+    # Market mood
+    print("🌍 Checking Nifty 50 mood...")
+    market_mood = get_market_mood()
+    print(f"   → {market_mood}\n")
+
+    # Scan
     results = []
     total   = len(WATCHLIST)
     for i, ticker in enumerate(WATCHLIST):
         df = fetch_data(ticker)
         if df is not None:
-            rec = analyse(ticker, df)
+            rec = analyse(ticker, df, market_mood)
             if rec:
                 results.append(rec)
         if (i + 1) % 20 == 0:
             print(f"  {i+1}/{total} scanned — {len(results)} signals so far")
 
-    # Sort and trim
-    buys   = sorted([r for r in results if r["signal"] == "BUY"],   key=lambda x: -x["score"])
-    shorts = sorted([r for r in results if r["signal"] == "SHORT"],  key=lambda x: x["score"])
+    buys   = sorted([r for r in results if r["signal"] == "BUY"],  key=lambda x: -x["score"])
+    shorts = sorted([r for r in results if r["signal"] == "SHORT"], key=lambda x: x["score"])
     final  = (buys + shorts)[:MAX_OUTPUT]
 
-    if not final:
-        print("\n😐 No strong signals today.")
-        send_telegram("📊 <b>NSE Scan Complete</b>\n\nNo strong signals today. Market is ranging. Stay patient. 💤")
-        return
-
-    # Print to Render logs
     print(f"\n{'─'*55}")
+    if not final:
+        print("😐 No strong signals today.")
     for r in final:
         icon = "🟢" if r["signal"] == "BUY" else "🔴"
-        print(f"{icon} {r['symbol']:15} {r['signal']:6}  ₹{r['price']}  →  ₹{r['target']}  SL: ₹{r['sl']}")
+        print(f"{icon} {r['symbol']:15} {r['signal']:6}  ₹{r['price']}  →  ₹{r['target']}  SL: ₹{r['sl']}  200EMA: {r['vs200']}%")
         for reason in r["reasons"]:
             print(f"   • {reason}")
     print(f"{'─'*55}\n")
 
-    send_telegram(build_message(final))
+    send_telegram(build_message(final, market_mood))
 
 if __name__ == "__main__":
     main()
