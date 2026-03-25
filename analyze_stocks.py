@@ -251,13 +251,17 @@ def send_telegram(message: str):
     else:
         print(f"❌ Telegram error: {r.text}")
 
+def esc(text) -> str:
+    """Escape HTML special characters to prevent Telegram parse errors."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def build_message(results: list, market_mood: str) -> str:
     now       = datetime.now().strftime("%d %b %Y, %I:%M %p")
     mood_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(market_mood, "🟡")
     lines = [
         f"📊 <b>NSE Evening Scan</b>",
-        f"🕐 {now} IST",
-        f"🌍 Market: {mood_icon} {market_mood}\n"
+        f"🕐 {esc(now)} IST",
+        f"🌍 Market: {mood_icon} {esc(market_mood)}\n"
     ]
 
     buys   = [r for r in results if r["signal"] == "BUY"]
@@ -266,25 +270,27 @@ def build_message(results: list, market_mood: str) -> str:
     if buys:
         lines.append("🟢 <b>BUY (LONG)</b>")
         for r in buys:
+            reasons = esc(' • '.join(r['reasons'][:3]))
             lines.append(
-                f"\n<b>{r['symbol']}</b>  (Score: {r['score']})\n"
+                f"\n<b>{esc(r['symbol'])}</b>  (Score: {r['score']})\n"
                 f"  💰 Entry: ₹{r['price']}\n"
                 f"  🎯 Target: ₹{r['target']}  (+1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (-0.5%)\n"
                 f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  vs200EMA: {r['vs200']}%\n"
-                f"  📝 {' • '.join(r['reasons'][:3])}"
+                f"  📝 {reasons}"
             )
 
     if shorts:
         lines.append("\n🔴 <b>SHORT (SELL)</b>")
         for r in shorts:
+            reasons = esc(' • '.join(r['reasons'][:3]))
             lines.append(
-                f"\n<b>{r['symbol']}</b>  (Score: {r['score']})\n"
+                f"\n<b>{esc(r['symbol'])}</b>  (Score: {r['score']})\n"
                 f"  💰 Entry: ₹{r['price']}\n"
                 f"  🎯 Target: ₹{r['target']}  (-1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (+0.5%)\n"
                 f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  vs200EMA: {r['vs200']}%\n"
-                f"  📝 {' • '.join(r['reasons'][:3])}\n"
+                f"  📝 {reasons}\n"
                 f"  📦 Instrument: Futures or Put Option"
             )
 
