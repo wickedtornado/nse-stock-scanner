@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-NSE Stock Analyser v3 — Multi-Strategy Engine
-Strategies integrated:
-  1. SuperTrend + RSI (highest win rate in trending markets)
-  2. EMA Crossover (8/21 cross with 55 EMA trend filter)
-  3. ATR momentum confirmation (expanding volatility = conviction)
-  4. 200 EMA trend guard (no BUY in downtrend, no SHORT in uptrend)
-  5. Market mood filter (Nifty 50 direction)
-  6. Volume confirmation (mandatory, not bonus)
-
-Signal requires at least 2 strategies to agree = fewer but higher quality signals.
+NSE Stock Analyser v4 — Research-backed Multi-Layer Strategy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+What's new vs v3:
+  1. ADX filter — only trade stocks in strong trends (ADX > 25)
+     Below 25 = ranging market = skip entirely
+  2. Corrected RSI logic — BUY when RSI 35-55 in uptrend (pullback)
+     Not RSI < 30 in downtrend (falling knife)
+  3. FII/DII sentiment — fetched live from NSE
+     Heavy FII selling = suppress BUY signals
+  4. SuperTrend + EMA must BOTH agree for signal
+  5. India VIX awareness — high VIX = tighter filters
+  6. Cleaner signal output — quality over quantity
 """
 
 import os
@@ -31,8 +33,13 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ──────────────────────────────────────────────
 MIN_PROFIT_PCT  = 1.0
 STOP_LOSS_PCT   = 0.5
-MAX_OUTPUT      = 5        # max signals — quality over quantity
+MAX_OUTPUT      = 5
 MIN_AVG_VOLUME  = 500_000
+ADX_THRESHOLD   = 25      # below this = ranging market = skip
+RSI_BUY_MIN     = 35      # RSI pullback zone for BUY in uptrend
+RSI_BUY_MAX     = 55      # don't buy overbought stocks
+RSI_SHORT_MIN   = 50      # don't short oversold stocks
+RSI_SHORT_MAX   = 72      # RSI overbought zone for SHORT in downtrend
 
 # ──────────────────────────────────────────────
 # WATCHLIST
@@ -71,22 +78,68 @@ def fetch_data(ticker: str, period: str = "1y"):
         for col in df.columns:
             df[col] = df[col].astype(float)
         return df
-    except Exception as e:
-        print(f"  ⚠️  {ticker}: {e}")
+    except Exception:
         return None
 
 # ──────────────────────────────────────────────
-# MARKET MOOD — Nifty 50
+# FII/DII SENTIMENT — fetch from NSE
+# ──────────────────────────────────────────────
+def get_fii_sentiment() -> dict:
+    """
+    Fetch latest FII/DII data from NSE.
+    Returns dict with net_fii (crore), net_dii (crore), sentiment label.
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+            "Referer": "https://www.nseindia.com"
+        }
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        r = session.get(
+            "https://www.nseindia.com/api/fiidiiTradeReact",
+            headers=headers, timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            # Get most recent entry
+            if isinstance(data, list) and len(data) > 0:
+                latest = data[0]
+                fii_net = float(latest.get("fiinet", 0))
+                dii_net = float(latest.get("diinet", 0))
+
+                if fii_net > 2000:
+                    sentiment = "FII_BULLISH"
+                elif fii_net < -2000 and dii_net < 0:
+                    sentiment = "FII_BEARISH"
+                elif fii_net < -2000:
+                    sentiment = "FII_SELLING_DII_SUPPORTING"
+                else:
+                    sentiment = "NEUTRAL"
+
+                return {
+                    "fii_net": round(fii_net, 0),
+                    "dii_net": round(dii_net, 0),
+                    "sentiment": sentiment
+                }
+    except Exception as e:
+        print(f"  ⚠️  FII data fetch failed: {e}")
+
+    return {"fii_net": 0, "dii_net": 0, "sentiment": "NEUTRAL"}
+
+# ──────────────────────────────────────────────
+# MARKET MOOD — Nifty 50 trend
 # ──────────────────────────────────────────────
 def get_market_mood() -> str:
     df = fetch_data("^NSEI")
     if df is None:
         return "NEUTRAL"
-    close = df["Close"]
+    close  = df["Close"]
     ema20  = close.ewm(span=20, adjust=False).mean().iloc[-1]
     ema50  = close.ewm(span=50, adjust=False).mean().iloc[-1]
     ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
-    price  = close.iloc[-1]
+    price  = float(close.iloc[-1])
     if price > ema20 > ema50 > ema200:
         return "BULLISH"
     elif price < ema20 and price < ema50:
@@ -94,7 +147,22 @@ def get_market_mood() -> str:
     return "NEUTRAL"
 
 # ──────────────────────────────────────────────
-# INDICATORS
+# INDIA VIX
+# ──────────────────────────────────────────────
+def get_india_vix() -> float:
+    try:
+        df = yf.download("^INDIAVIX", period="5d", interval="1d",
+                         progress=False, auto_adjust=True)
+        if df is not None and len(df) > 0:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return round(float(df["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+    return 15.0  # default neutral VIX
+
+# ──────────────────────────────────────────────
+# TECHNICAL INDICATORS
 # ──────────────────────────────────────────────
 def calc_rsi(series: pd.Series, period=14) -> float:
     delta = series.diff()
@@ -105,7 +173,9 @@ def calc_rsi(series: pd.Series, period=14) -> float:
     return round(float(val), 2)
 
 def calc_atr(df: pd.DataFrame, period=14) -> pd.Series:
-    high, low, close = df["High"], df["Low"], df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+    close = df["Close"]
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -113,48 +183,57 @@ def calc_atr(df: pd.DataFrame, period=14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def calc_supertrend(df: pd.DataFrame, period=10, multiplier=3.0):
+def calc_adx(df: pd.DataFrame, period=14) -> float:
     """
-    SuperTrend indicator.
-    Returns series: +1 = bullish (price above supertrend), -1 = bearish.
+    ADX — Average Directional Index.
+    Returns 0-100. Above 25 = trending. Below 25 = ranging (avoid trading).
     """
-    atr    = calc_atr(df, period)
-    hl2    = (df["High"] + df["Low"]) / 2
-    upper  = hl2 + multiplier * atr
-    lower  = hl2 - multiplier * atr
-    close  = df["Close"]
+    try:
+        high  = df["High"].values
+        low   = df["Low"].values
+        close = df["Close"].values
+        n     = len(close)
 
-    supertrend = pd.Series(index=df.index, dtype=float)
-    direction  = pd.Series(index=df.index, dtype=int)
+        plus_dm  = np.zeros(n)
+        minus_dm = np.zeros(n)
+        tr_arr   = np.zeros(n)
 
-    for i in range(1, len(df)):
-        # Lower band
-        if lower.iloc[i] > lower.iloc[i-1] or close.iloc[i-1] < lower.iloc[i-1]:
-            final_lower = lower.iloc[i]
-        else:
-            final_lower = lower.iloc[i-1]
+        for i in range(1, n):
+            h_diff = high[i] - high[i-1]
+            l_diff = low[i-1] - low[i]
+            plus_dm[i]  = h_diff if h_diff > l_diff and h_diff > 0 else 0
+            minus_dm[i] = l_diff if l_diff > h_diff and l_diff > 0 else 0
+            tr_arr[i]   = max(high[i] - low[i],
+                              abs(high[i] - close[i-1]),
+                              abs(low[i]  - close[i-1]))
 
-        # Upper band
-        if upper.iloc[i] < upper.iloc[i-1] or close.iloc[i-1] > upper.iloc[i-1]:
-            final_upper = upper.iloc[i]
-        else:
-            final_upper = upper.iloc[i-1]
+        def smooth(arr, p):
+            result = np.zeros(n)
+            result[p] = arr[1:p+1].sum()
+            for i in range(p+1, n):
+                result[i] = result[i-1] - result[i-1]/p + arr[i]
+            return result
 
-        # Direction
-        if i == 1:
-            direction.iloc[i] = 1
-        elif supertrend.iloc[i-1] == upper.iloc[i-1]:
-            direction.iloc[i] = -1 if close.iloc[i] > final_upper else 1
-        else:
-            direction.iloc[i] = 1 if close.iloc[i] < final_lower else -1
+        atr_s    = smooth(tr_arr, period)
+        plus_s   = smooth(plus_dm, period)
+        minus_s  = smooth(minus_dm, period)
 
-        supertrend.iloc[i] = final_lower if direction.iloc[i] == -1 else final_upper
+        plus_di  = 100 * plus_s  / np.where(atr_s == 0, 1, atr_s)
+        minus_di = 100 * minus_s / np.where(atr_s == 0, 1, atr_s)
 
-    return direction  # -1 = bearish, 1 = bullish... wait, flip:
-    # convention: direction -1 means price is ABOVE supertrend = BUY zone
+        dx = 100 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) == 0, 1, (plus_di + minus_di))
 
-def calc_supertrend_signal(df: pd.DataFrame, period=10, multiplier=3.0) -> int:
-    """Returns +1 (bullish) or -1 (bearish) based on SuperTrend."""
+        adx = np.zeros(n)
+        adx[2*period] = dx[period:2*period+1].mean()
+        for i in range(2*period+1, n):
+            adx[i] = (adx[i-1] * (period-1) + dx[i]) / period
+
+        return round(float(adx[-1]), 2)
+    except Exception:
+        return 0.0
+
+def calc_supertrend(df: pd.DataFrame, period=10, multiplier=3.0) -> int:
+    """Returns +1 (bullish) or -1 (bearish)."""
     try:
         atr   = calc_atr(df, period)
         hl2   = (df["High"] + df["Low"]) / 2
@@ -162,23 +241,19 @@ def calc_supertrend_signal(df: pd.DataFrame, period=10, multiplier=3.0) -> int:
         lower = (hl2 - multiplier * atr).values
         close = df["Close"].values
 
-        final_upper = upper.copy()
-        final_lower = lower.copy()
-        direction   = np.ones(len(close), dtype=int)  # 1 = bullish
+        fu = upper.copy()
+        fl = lower.copy()
+        direction = np.ones(len(close), dtype=int)
 
         for i in range(1, len(close)):
-            # Adjust lower band
-            final_lower[i] = lower[i] if lower[i] > final_lower[i-1] or close[i-1] < final_lower[i-1] else final_lower[i-1]
-            # Adjust upper band
-            final_upper[i] = upper[i] if upper[i] < final_upper[i-1] or close[i-1] > final_upper[i-1] else final_upper[i-1]
+            fl[i] = lower[i] if lower[i] > fl[i-1] or close[i-1] < fl[i-1] else fl[i-1]
+            fu[i] = upper[i] if upper[i] < fu[i-1] or close[i-1] > fu[i-1] else fu[i-1]
+            if direction[i-1] == 1:
+                direction[i] = -1 if close[i] < fl[i] else 1
+            else:
+                direction[i] = 1 if close[i] > fu[i] else -1
 
-            # Determine direction
-            if direction[i-1] == 1:  # was bullish
-                direction[i] = -1 if close[i] < final_lower[i] else 1
-            else:  # was bearish
-                direction[i] = 1 if close[i] > final_upper[i] else -1
-
-        return int(direction[-1])  # +1 = bullish, -1 = bearish
+        return int(direction[-1])
     except Exception:
         return 0
 
@@ -198,14 +273,16 @@ def calc_vol_spike(vol: pd.Series) -> float:
     return round(float(vol.iloc[-1] / avg), 2) if avg > 0 else 1.0
 
 # ──────────────────────────────────────────────
-# MULTI-STRATEGY ANALYSIS ENGINE v3
+# ANALYSIS ENGINE v4
 # ──────────────────────────────────────────────
-def analyse(ticker: str, df: pd.DataFrame, market_mood: str):
+def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
+            fii_sentiment: str, vix: float) -> dict | None:
+
     close  = df["Close"]
     volume = df["Volume"]
     symbol = ticker.replace(".NS", "")
 
-    # Liquidity filter
+    # Liquidity check
     if volume.iloc[-20:].mean() < MIN_AVG_VOLUME:
         return None
 
@@ -213,101 +290,117 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str):
     prev    = round(float(close.iloc[-2]), 2)
     day_chg = round((price - prev) / prev * 100, 2)
 
-    # ── Compute all indicators ──────────────────
-    rsi_val                  = calc_rsi(close)
-    macd_val, sig_val, hist  = calc_macd(close)
-    ema8                     = calc_ema(close, 8)
-    ema21                    = calc_ema(close, 21)
-    ema55                    = calc_ema(close, 55)
-    ema200                   = calc_ema(close, min(200, len(close)-1))
-    vspike                   = calc_vol_spike(volume)
-    supertrend_dir           = calc_supertrend_signal(df)
+    # ── Core indicators ─────────────────────────
+    rsi_val   = calc_rsi(close)
+    adx_val   = calc_adx(df)
+    st_dir    = calc_supertrend(df)       # +1 = bullish, -1 = bearish
+    macd_val, sig_val, hist = calc_macd(close)
+    ema8      = calc_ema(close, 8)
+    ema21     = calc_ema(close, 21)
+    ema55     = calc_ema(close, 55)
+    ema200    = calc_ema(close, min(200, len(close)-1))
+    vspike    = calc_vol_spike(volume)
 
-    atr_series   = calc_atr(df)
-    atr_now      = float(atr_series.iloc[-1])
-    atr_20avg    = float(atr_series.iloc[-21:-1].mean())
-    atr_expanding = atr_now > atr_20avg  # momentum is expanding
+    pct_200   = round((price - ema200) / ema200 * 100, 2)
+    above_200 = price > ema200
+    deep_down = pct_200 < -15
 
-    pct_from_200 = round((price - ema200) / ema200 * 100, 2)
-    above_200    = price > ema200
-    deep_down    = pct_from_200 < -15
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # GATE 1 — ADX filter (most important gate)
+    # If market not trending, skip entirely
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if adx_val < ADX_THRESHOLD:
+        return None  # ranging market — no trade
 
-    # ── STRATEGY 1: SuperTrend + RSI ───────────
-    # Highest win rate in trending markets
-    st_buy  = supertrend_dir == 1  and rsi_val < 60 and rsi_val > 30
-    st_sell = supertrend_dir == -1 and rsi_val > 40 and rsi_val < 75
-
-    # ── STRATEGY 2: EMA Crossover ──────────────
-    # 8 EMA cross above 21 EMA, price above 55 EMA = BUY
-    # 8 EMA cross below 21 EMA, price below 55 EMA = SELL
-    ema_buy  = ema8 > ema21 and price > ema55
-    ema_sell = ema8 < ema21 and price < ema55
-
-    # ── STRATEGY 3: MACD momentum ──────────────
-    macd_buy  = macd_val > sig_val and hist > 0
-    macd_sell = macd_val < sig_val and hist < 0
-
-    # ── STRATEGY 4: RSI extreme reversal ───────
-    # Only use RSI alone when it's extreme AND ATR is expanding
-    rsi_buy  = rsi_val < 32 and atr_expanding
-    rsi_sell = rsi_val > 72 and atr_expanding
-
-    # ── Count how many strategies agree ────────
-    buy_votes  = sum([st_buy,  ema_buy,  macd_buy,  rsi_buy])
-    sell_votes = sum([st_sell, ema_sell, macd_sell, rsi_sell])
-
-    # ── Build reasons list ─────────────────────
-    reasons = []
-    if st_buy  or st_sell:  reasons.append(f"SuperTrend {'bullish' if st_buy else 'bearish'}")
-    if ema_buy or ema_sell: reasons.append(f"EMA crossover {'bullish' if ema_buy else 'bearish'} (8/21/55)")
-    if macd_buy or macd_sell: reasons.append(f"MACD {'bullish' if macd_buy else 'bearish'} crossover")
-    if rsi_buy or rsi_sell: reasons.append(f"RSI {'oversold' if rsi_buy else 'overbought'} ({rsi_val}) + ATR expanding")
-    if vspike >= 1.5:       reasons.append(f"Volume spike {vspike}x avg")
-    if above_200:           reasons.append(f"Above 200 EMA (+{pct_from_200}%)")
-    else:                   reasons.append(f"Below 200 EMA ({pct_from_200}%)")
-
-    # ── HARD RULES ─────────────────────────────
-    # Rule 1: Need at least 2 strategies to agree
-    # Rule 2: No BUY if deep downtrend (>15% below 200 EMA)
-    # Rule 3: No BUY in BEARISH market unless supertrend + ema both agree
-    # Rule 4: No SHORT in BULLISH market
-    # Rule 5: Volume must be at least average (>= 0.9x)
-
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # GATE 2 — Volume filter
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if vspike < 0.9:
-        return None  # dead volume — skip
+        return None  # dead volume
 
-    if buy_votes >= 2 and not deep_down:
-        if market_mood == "BEARISH" and buy_votes < 3:
-            return None  # need stronger signal in bearish market
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # BUY CONDITIONS — research-backed rules
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    buy_conditions = {
+        "above_200ema":    above_200,                          # long-term trend
+        "supertrend_bull": st_dir == 1,                        # SuperTrend bullish
+        "ema_crossover":   ema8 > ema21 and price > ema55,    # EMA aligned
+        "macd_bull":       macd_val > sig_val and hist > 0,   # MACD crossover
+        "rsi_pullback":    RSI_BUY_MIN <= rsi_val <= RSI_BUY_MAX,  # RSI in buy zone
+        "volume_ok":       vspike >= 1.0,                      # sufficient volume
+    }
+
+    # SHORT CONDITIONS
+    short_conditions = {
+        "below_200ema":    not above_200,                      # long-term downtrend
+        "supertrend_bear": st_dir == -1,                       # SuperTrend bearish
+        "ema_crossover":   ema8 < ema21 and price < ema55,    # EMA aligned down
+        "macd_bear":       macd_val < sig_val and hist < 0,   # MACD crossover down
+        "rsi_zone":        RSI_SHORT_MIN <= rsi_val <= RSI_SHORT_MAX,  # RSI in short zone
+        "volume_ok":       vspike >= 1.0,
+    }
+
+    buy_score  = sum(buy_conditions.values())
+    short_score = sum(short_conditions.values())
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # HARD RULES
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Must have at least 4/6 conditions for BUY
+    # Must have at least 4/6 conditions for SHORT
+    # Hard block BUY if deep downtrend
+    # Hard block SHORT if market is BULLISH and FII buying
+    # High VIX = require stronger signals
+    min_score = 5 if vix > 18 else 4
+
+    reasons = []
+
+    if buy_score >= min_score and not deep_down:
+        # Market-level suppression
+        if market_mood == "BEARISH" and fii_sentiment == "FII_BEARISH":
+            return None  # don't fight both market and FIIs
+        if buy_conditions["above_200ema"]:   reasons.append(f"Above 200 EMA (+{pct_200}%)")
+        if buy_conditions["supertrend_bull"]: reasons.append("SuperTrend bullish")
+        if buy_conditions["ema_crossover"]:   reasons.append("EMA 8 > 21 > 55 aligned")
+        if buy_conditions["macd_bull"]:       reasons.append("MACD bullish crossover")
+        if buy_conditions["rsi_pullback"]:    reasons.append(f"RSI pullback in uptrend ({rsi_val})")
+        if vspike >= 1.5:                     reasons.append(f"Volume spike {vspike}x")
         signal = "BUY"
         target = round(price * (1 + MIN_PROFIT_PCT / 100), 2)
         sl     = round(price * (1 - STOP_LOSS_PCT / 100), 2)
-        score  = buy_votes * 25
+        score  = buy_score
 
-    elif sell_votes >= 2:
-        if market_mood == "BULLISH" and sell_votes < 3:
-            return None  # need stronger signal in bullish market
+    elif short_score >= min_score:
+        # Market-level suppression
+        if market_mood == "BULLISH" and fii_sentiment == "FII_BULLISH":
+            return None  # don't short a strong bull market
+        if short_conditions["below_200ema"]:   reasons.append(f"Below 200 EMA ({pct_200}%)")
+        if short_conditions["supertrend_bear"]: reasons.append("SuperTrend bearish")
+        if short_conditions["ema_crossover"]:   reasons.append("EMA 8 < 21 < 55 aligned")
+        if short_conditions["macd_bear"]:       reasons.append("MACD bearish crossover")
+        if short_conditions["rsi_zone"]:        reasons.append(f"RSI in short zone ({rsi_val})")
+        if vspike >= 1.5:                       reasons.append(f"Volume spike {vspike}x")
         signal = "SHORT"
         target = round(price * (1 - MIN_PROFIT_PCT / 100), 2)
         sl     = round(price * (1 + STOP_LOSS_PCT / 100), 2)
-        score  = -(sell_votes * 25)
+        score  = short_score
 
     else:
-        return None  # not enough agreement — skip
+        return None
 
     return {
-        "symbol":    symbol,
-        "signal":    signal,
-        "price":     price,
-        "target":    target,
-        "sl":        sl,
-        "score":     abs(score),
-        "rsi":       rsi_val,
-        "vol":       vspike,
-        "day_chg":   day_chg,
-        "vs200":     pct_from_200,
-        "strategies": buy_votes if signal == "BUY" else sell_votes,
-        "reasons":   reasons,
+        "symbol":  symbol,
+        "signal":  signal,
+        "price":   price,
+        "target":  target,
+        "sl":      sl,
+        "score":   score,
+        "adx":     adx_val,
+        "rsi":     rsi_val,
+        "vol":     vspike,
+        "day_chg": day_chg,
+        "vs200":   pct_200,
+        "reasons": reasons,
     }
 
 # ──────────────────────────────────────────────
@@ -331,13 +424,21 @@ def send_telegram(message: str):
     else:
         print(f"❌ Telegram error: {r.text}")
 
-def build_message(results: list, market_mood: str) -> str:
+def build_message(results: list, market_mood: str,
+                  fii_data: dict, vix: float) -> str:
     now       = datetime.now().strftime("%d %b %Y, %I:%M %p")
     mood_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(market_mood, "🟡")
+    fii_icon  = "🟢" if fii_data["fii_net"] > 0 else "🔴"
+    vix_icon  = "🔴" if vix > 18 else "🟡" if vix > 14 else "🟢"
+
     lines = [
-        f"📊 <b>NSE Evening Scan v3</b>",
-        f"🕐 {esc(now)} IST",
-        f"🌍 Nifty Mood: {mood_icon} {esc(market_mood)}\n"
+        f"📊 <b>NSE Evening Scan v4</b>",
+        f"🕐 {esc(now)} IST\n",
+        f"<b>Market Context</b>",
+        f"  {mood_icon} Nifty Trend: {esc(market_mood)}",
+        f"  {fii_icon} FII Flow: ₹{esc(str(fii_data['fii_net']))} Cr  |  DII: ₹{esc(str(fii_data['dii_net']))} Cr",
+        f"  {vix_icon} India VIX: {esc(str(vix))}",
+        ""
     ]
 
     buys   = [r for r in results if r["signal"] == "BUY"]
@@ -346,26 +447,26 @@ def build_message(results: list, market_mood: str) -> str:
     if buys:
         lines.append("🟢 <b>BUY (LONG)</b>")
         for r in buys:
-            reasons_str = esc(" • ".join(r["reasons"][:4]))
+            reasons_str = esc(" • ".join(r["reasons"]))
             lines.append(
-                f"\n<b>{esc(r['symbol'])}</b>  ({r['strategies']}/4 strategies agree)\n"
+                f"\n<b>{esc(r['symbol'])}</b>  ({r['score']}/6 conditions met)\n"
                 f"  💰 Entry: ₹{r['price']}\n"
                 f"  🎯 Target: ₹{r['target']}  (+1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (-0.5%)\n"
-                f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  vs200EMA: {r['vs200']}%\n"
+                f"  📊 RSI: {r['rsi']}  |  ADX: {r['adx']}  |  Vol: {r['vol']}x\n"
                 f"  📝 {reasons_str}"
             )
 
     if shorts:
         lines.append("\n🔴 <b>SHORT (SELL)</b>")
         for r in shorts:
-            reasons_str = esc(" • ".join(r["reasons"][:4]))
+            reasons_str = esc(" • ".join(r["reasons"]))
             lines.append(
-                f"\n<b>{esc(r['symbol'])}</b>  ({r['strategies']}/4 strategies agree)\n"
+                f"\n<b>{esc(r['symbol'])}</b>  ({r['score']}/6 conditions met)\n"
                 f"  💰 Entry: ₹{r['price']}\n"
                 f"  🎯 Target: ₹{r['target']}  (-1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (+0.5%)\n"
-                f"  📊 RSI: {r['rsi']}  |  Vol: {r['vol']}x  |  vs200EMA: {r['vs200']}%\n"
+                f"  📊 RSI: {r['rsi']}  |  ADX: {r['adx']}  |  Vol: {r['vol']}x\n"
                 f"  📝 {reasons_str}\n"
                 f"  📦 Instrument: Futures or Put Option"
             )
@@ -373,12 +474,15 @@ def build_message(results: list, market_mood: str) -> str:
     if not buys and not shorts:
         lines.append(
             "😐 <b>No signals today.</b>\n\n"
-            "Filters didn't find a clean setup. "
-            "This is correct behaviour — not every day has a trade. "
-            "Staying out is also a position. 💤"
+            "ADX filter blocked all ranging stocks. "
+            "No clean trending setups found today.\n"
+            "Staying out is the right call. 💤"
         )
 
-    lines.append("\n⚠️ <i>Educational only. Not SEBI-registered advice. Always set SL before entering.</i>")
+    lines.append(
+        "\n⚠️ <i>Educational only. Not SEBI-registered advice.\n"
+        "Always place stop-loss before entering any trade.</i>"
+    )
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────
@@ -386,47 +490,62 @@ def build_message(results: list, market_mood: str) -> str:
 # ──────────────────────────────────────────────
 def main():
     print(f"\n{'═'*55}")
-    print(f"  NSE Stock Scanner v3 — {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+    print(f"  NSE Scanner v4 — {datetime.now().strftime('%d %b %Y %I:%M %p')}")
     print(f"{'═'*55}\n")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("❌ Missing Telegram credentials")
         sys.exit(1)
 
-    # Market mood
-    print("🌍 Checking Nifty 50 mood...")
+    # Market context
+    print("🌍 Fetching market context...")
     market_mood = get_market_mood()
-    print(f"   Mood: {market_mood}\n")
+    fii_data    = get_fii_sentiment()
+    vix         = get_india_vix()
+    print(f"   Nifty mood : {market_mood}")
+    print(f"   FII net    : ₹{fii_data['fii_net']} Cr ({fii_data['sentiment']})")
+    print(f"   India VIX  : {vix}")
+    print(f"   Min ADX    : {ADX_THRESHOLD} (stocks below this are skipped)\n")
 
     # Scan
     results = []
     total   = len(WATCHLIST)
+    skipped_adx = 0
+
     for i, ticker in enumerate(WATCHLIST):
         df = fetch_data(ticker)
         if df is not None:
-            rec = analyse(ticker, df, market_mood)
-            if rec:
-                results.append(rec)
+            # Quick ADX check before full analysis
+            adx_quick = calc_adx(df)
+            if adx_quick < ADX_THRESHOLD:
+                skipped_adx += 1
+            else:
+                rec = analyse(ticker, df, market_mood, fii_data["sentiment"], vix)
+                if rec:
+                    results.append(rec)
         if (i + 1) % 20 == 0:
-            print(f"  {i+1}/{total} scanned — {len(results)} signals so far")
+            print(f"  {i+1}/{total} scanned — {len(results)} signals, {skipped_adx} skipped (ranging)")
 
-    # Sort — BUY by score desc, SHORT by score desc
-    buys   = sorted([r for r in results if r["signal"] == "BUY"],  key=lambda x: (-x["strategies"], -x["score"]))
-    shorts = sorted([r for r in results if r["signal"] == "SHORT"], key=lambda x: (-x["strategies"], -x["score"]))
+    print(f"\n  Total skipped (ADX < {ADX_THRESHOLD}): {skipped_adx}/{total}")
+
+    # Sort
+    buys   = sorted([r for r in results if r["signal"] == "BUY"],  key=lambda x: -x["score"])
+    shorts = sorted([r for r in results if r["signal"] == "SHORT"], key=lambda x: -x["score"])
     final  = (buys + shorts)[:MAX_OUTPUT]
 
-    # Console output
+    # Console
     print(f"\n{'─'*55}")
     if not final:
         print("😐 No strong signals today.")
     for r in final:
         icon = "🟢" if r["signal"] == "BUY" else "🔴"
-        print(f"{icon} {r['symbol']:15} {r['signal']:6}  ₹{r['price']}  →  ₹{r['target']}  SL: ₹{r['sl']}  [{r['strategies']}/4 strategies]")
+        print(f"{icon} {r['symbol']:15} {r['signal']:6}  ₹{r['price']}  →  ₹{r['target']}  SL: ₹{r['sl']}")
+        print(f"   ADX: {r['adx']}  RSI: {r['rsi']}  Vol: {r['vol']}x  Score: {r['score']}/6")
         for reason in r["reasons"]:
             print(f"   • {reason}")
     print(f"{'─'*55}\n")
 
-    send_telegram(build_message(final, market_mood))
+    send_telegram(build_message(final, market_mood, fii_data, vix))
 
 if __name__ == "__main__":
     main()
