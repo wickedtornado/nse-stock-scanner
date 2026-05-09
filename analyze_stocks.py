@@ -318,6 +318,17 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
     if vspike < 0.9:
         return None  # dead volume
 
+    # GATE 3 - Hard RSI gate (mandatory, not optional)
+    # RSI must be in valid zone - no exceptions
+    is_potential_buy   = above_200 and (st_dir == 1 or ema8 > ema21)
+    is_potential_short = not above_200 and (st_dir == -1 or ema8 < ema21)
+
+    if is_potential_buy and not (RSI_BUY_MIN <= rsi_val <= RSI_BUY_MAX):
+        return None  # RSI outside 35-55 - rejected
+
+    if is_potential_short and not (RSI_SHORT_MIN <= rsi_val <= RSI_SHORT_MAX):
+        return None  # RSI outside 50-72 - rejected
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # BUY CONDITIONS — research-backed rules
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
