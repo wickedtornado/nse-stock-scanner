@@ -129,22 +129,88 @@ def get_fii_sentiment() -> dict:
     return {"fii_net": 0, "dii_net": 0, "sentiment": "NEUTRAL"}
 
 # ──────────────────────────────────────────────
-# MARKET MOOD — Nifty 50 trend
+# MARKET MOOD — Nifty 50 trend (improved)
+# Factors: EMA alignment + ADX strength + breadth
 # ──────────────────────────────────────────────
-def get_market_mood() -> str:
+def get_market_mood() -> dict:
+    """
+    Returns mood dict with:
+      - mood: BULLISH / BEARISH / NEUTRAL
+      - adx: Nifty trend strength
+      - breadth: % of watchlist stocks above 200 EMA
+      - detail: human readable summary
+    """
     df = fetch_data("^NSEI")
     if df is None:
-        return "NEUTRAL"
-    close  = df["Close"]
-    ema20  = close.ewm(span=20, adjust=False).mean().iloc[-1]
-    ema50  = close.ewm(span=50, adjust=False).mean().iloc[-1]
-    ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
-    price  = float(close.iloc[-1])
-    if price > ema20 > ema50 > ema200:
-        return "BULLISH"
-    elif price < ema20 and price < ema50:
-        return "BEARISH"
-    return "NEUTRAL"
+        return {"mood": "NEUTRAL", "adx": 0, "breadth": 0, "detail": "Data unavailable"}
+
+    close = df["Close"]
+    price = float(close.iloc[-1])
+    ema20  = float(close.ewm(span=20,  adjust=False).mean().iloc[-1])
+    ema50  = float(close.ewm(span=50,  adjust=False).mean().iloc[-1])
+    ema200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1])
+
+    # Factor 1 — EMA alignment score (0-3)
+    ema_score = 0
+    if price > ema20:  ema_score += 1
+    if ema20  > ema50: ema_score += 1
+    if ema50  > ema200: ema_score += 1
+
+    # Factor 2 — Nifty ADX (trend strength)
+    nifty_adx = calc_adx(df)
+    trend_strong = nifty_adx > 25
+
+    # Factor 3 — Market breadth
+    # Check how many watchlist stocks are above their 200 EMA
+    above_200_count = 0
+    checked = 0
+    sample = WATCHLIST[:30]  # check first 30 stocks for speed
+    for ticker in sample:
+        try:
+            bdf = fetch_data(ticker, period="1y")
+            if bdf is not None and len(bdf) >= 200:
+                c = bdf["Close"]
+                e200 = float(c.ewm(span=200, adjust=False).mean().iloc[-1])
+                if float(c.iloc[-1]) > e200:
+                    above_200_count += 1
+                checked += 1
+        except Exception:
+            continue
+    breadth_pct = round(above_200_count / checked * 100, 1) if checked > 0 else 50.0
+
+    # Combine all 3 factors into final mood
+    bullish_points = 0
+    bearish_points = 0
+
+    # EMA alignment
+    if ema_score == 3:   bullish_points += 2
+    elif ema_score == 2: bullish_points += 1
+    elif ema_score == 0: bearish_points += 2
+    elif ema_score == 1: bearish_points += 1
+
+    # ADX confirmation
+    if trend_strong and ema_score >= 2: bullish_points += 1
+    if trend_strong and ema_score <= 1: bearish_points += 1
+
+    # Breadth
+    if breadth_pct > 60:   bullish_points += 2
+    elif breadth_pct > 50: bullish_points += 1
+    elif breadth_pct < 35: bearish_points += 2
+    elif breadth_pct < 50: bearish_points += 1
+
+    if bullish_points >= 3 and bullish_points > bearish_points:
+        mood = "BULLISH"
+    elif bearish_points >= 3 and bearish_points > bullish_points:
+        mood = "BEARISH"
+    else:
+        mood = "NEUTRAL"
+
+    detail = f"EMA score {ema_score}/3 | ADX {round(nifty_adx,1)} | Breadth {breadth_pct}% above 200EMA"
+    print(f"   Nifty EMA score : {ema_score}/3")
+    print(f"   Nifty ADX       : {round(nifty_adx, 1)} ({'trending' if trend_strong else 'ranging'})")
+    print(f"   Market breadth  : {breadth_pct}% stocks above 200 EMA")
+
+    return {"mood": mood, "adx": round(nifty_adx, 1), "breadth": breadth_pct, "detail": detail}
 
 # ──────────────────────────────────────────────
 # INDIA VIX
@@ -272,6 +338,31 @@ def calc_vol_spike(vol: pd.Series) -> float:
     avg = vol.iloc[-21:-1].mean()
     return round(float(vol.iloc[-1] / avg), 2) if avg > 0 else 1.0
 
+
+def calc_gap_risk(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """
+    Calculates overnight gap risk based on last N days of gap history.
+    Gap = difference between today open and yesterday close.
+    Returns avg gap %, max gap %, and risk label.
+    """
+    opens  = df["Open"].values
+    closes = df["Close"].values
+    gaps   = []
+    for i in range(1, min(lookback + 1, len(opens))):
+        gap_pct = abs((opens[i] - closes[i-1]) / closes[i-1] * 100)
+        gaps.append(gap_pct)
+    if not gaps:
+        return {"avg_gap": 0.0, "max_gap": 0.0, "risk": "LOW"}
+    avg_gap = round(float(np.mean(gaps)), 2)
+    max_gap = round(float(np.max(gaps)), 2)
+    if avg_gap > 1.5 or max_gap > 3.0:
+        risk = "HIGH"
+    elif avg_gap > 0.75 or max_gap > 1.5:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+    return {"avg_gap": avg_gap, "max_gap": max_gap, "risk": risk}
+
 # ──────────────────────────────────────────────
 # ANALYSIS ENGINE v4
 # ──────────────────────────────────────────────
@@ -301,6 +392,7 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
     ema200    = calc_ema(close, min(200, len(close)-1))
     vspike    = calc_vol_spike(volume)
 
+    gap_info  = calc_gap_risk(df)
     pct_200   = round((price - ema200) / ema200 * 100, 2)
     above_200 = price > ema200
     deep_down = pct_200 < -15
@@ -411,6 +503,7 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
         "vol":     vspike,
         "day_chg": day_chg,
         "vs200":   pct_200,
+        "gap":     gap_info,
         "reasons": reasons,
     }
 
@@ -436,7 +529,7 @@ def send_telegram(message: str):
         print(f"❌ Telegram error: {r.text}")
 
 def build_message(results: list, market_mood: str,
-                  fii_data: dict, vix: float) -> str:
+                  mood_data: dict, fii_data: dict, vix: float) -> str:
     now       = datetime.now().strftime("%d %b %Y, %I:%M %p")
     mood_icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(market_mood, "🟡")
     fii_icon  = "🟢" if fii_data["fii_net"] > 0 else "🔴"
@@ -465,6 +558,7 @@ def build_message(results: list, market_mood: str,
                 f"  🎯 Target: ₹{r['target']}  (+1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (-0.5%)\n"
                 f"  📊 RSI: {r['rsi']}  |  ADX: {r['adx']}  |  Vol: {r['vol']}x\n"
+                f"  ⚡ Gap Risk: {r['gap']['risk']}  (avg {r['gap']['avg_gap']}%, max {r['gap']['max_gap']}%)\n"
                 f"  📝 {reasons_str}"
             )
 
@@ -478,6 +572,7 @@ def build_message(results: list, market_mood: str,
                 f"  🎯 Target: ₹{r['target']}  (-1%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (+0.5%)\n"
                 f"  📊 RSI: {r['rsi']}  |  ADX: {r['adx']}  |  Vol: {r['vol']}x\n"
+                f"  ⚡ Gap Risk: {r['gap']['risk']}  (avg {r['gap']['avg_gap']}%, max {r['gap']['max_gap']}%)\n"
                 f"  📝 {reasons_str}\n"
                 f"  📦 Instrument: Futures or Put Option"
             )
@@ -510,7 +605,8 @@ def main():
 
     # Market context
     print("🌍 Fetching market context...")
-    market_mood = get_market_mood()
+    mood_data   = get_market_mood()
+    market_mood = mood_data["mood"]
     fii_data    = get_fii_sentiment()
     vix         = get_india_vix()
     print(f"   Nifty mood : {market_mood}")
@@ -556,7 +652,7 @@ def main():
             print(f"   • {reason}")
     print(f"{'─'*55}\n")
 
-    send_telegram(build_message(final, market_mood, fii_data, vix))
+    send_telegram(build_message(final, market_mood, mood_data, fii_data, vix))
 
 if __name__ == "__main__":
     main()
