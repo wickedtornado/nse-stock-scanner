@@ -63,6 +63,88 @@ WATCHLIST = [
     "OBEROIRLTY.NS", "MUTHOOTFIN.NS", "PIIND.NS", "ALKEM.NS", "AUROPHARMA.NS",
 ]
 
+
+# ──────────────────────────────────────────────
+# SECTOR MAP — stock to sector mapping
+# ──────────────────────────────────────────────
+SECTOR_MAP = {
+    # IT
+    "TCS.NS":        "IT", "INFY.NS":       "IT", "WIPRO.NS":      "IT",
+    "HCLTECH.NS":    "IT", "TECHM.NS":      "IT", "PERSISTENT.NS": "IT",
+    "MPHASIS.NS":    "IT", "COFORGE.NS":    "IT", "NAUKRI.NS":     "IT",
+
+    # BANKING
+    "HDFCBANK.NS":   "BANK", "ICICIBANK.NS":  "BANK", "KOTAKBANK.NS":  "BANK",
+    "SBIN.NS":       "BANK", "AXISBANK.NS":   "BANK", "INDUSINDBK.NS": "BANK",
+    "BANKBARODA.NS": "BANK", "CANBK.NS":      "BANK", "FEDERALBNK.NS": "BANK",
+    "IDFCFIRSTB.NS": "BANK",
+
+    # FINANCIAL SERVICES
+    "BAJFINANCE.NS": "FINSERV", "BAJAJFINSV.NS": "FINSERV", "CHOLAFIN.NS":   "FINSERV",
+    "MUTHOOTFIN.NS": "FINSERV", "SBILIFE.NS":    "FINSERV", "HDFCLIFE.NS":   "FINSERV",
+    "ICICIGI.NS":    "FINSERV",
+
+    # PHARMA
+    "SUNPHARMA.NS":  "PHARMA", "DRREDDY.NS":    "PHARMA", "CIPLA.NS":      "PHARMA",
+    "DIVISLAB.NS":   "PHARMA", "TORNTPHARM.NS": "PHARMA", "LUPIN.NS":      "PHARMA",
+    "ALKEM.NS":      "PHARMA", "AUROPHARMA.NS": "PHARMA",
+
+    # AUTO
+    "MARUTI.NS":     "AUTO", "TATAMOTORS.NS": "AUTO", "M&M.NS":        "AUTO",
+    "HEROMOTOCO.NS": "AUTO", "EICHERMOT.NS":  "AUTO", "BAJAJ-AUTO.NS": "AUTO",
+
+    # METALS
+    "TATASTEEL.NS":  "METALS", "JSWSTEEL.NS":   "METALS", "HINDALCO.NS":   "METALS",
+    "VEDL.NS":       "METALS", "COALINDIA.NS":  "METALS",
+
+    # OIL & GAS
+    "RELIANCE.NS":   "OILGAS", "ONGC.NS":       "OILGAS", "BPCL.NS":       "OILGAS",
+    "IOC.NS":        "OILGAS", "GAIL.NS":        "OILGAS",
+
+    # FMCG
+    "HINDUNILVR.NS": "FMCG", "ITC.NS":        "FMCG", "BRITANNIA.NS":  "FMCG",
+    "TATACONSUM.NS": "FMCG", "MARICO.NS":     "FMCG", "COLPAL.NS":     "FMCG",
+    "DABUR.NS":      "FMCG", "GODREJCP.NS":   "FMCG",
+
+    # INFRA / CAPITAL GOODS
+    "LT.NS":         "INFRA", "ADANIPORTS.NS": "INFRA", "NTPC.NS":       "INFRA",
+    "POWERGRID.NS":  "INFRA", "TATAPOWER.NS":  "INFRA", "GRASIM.NS":     "INFRA",
+
+    # CONSUMER / RETAIL
+    "TITAN.NS":      "CONSUMER", "ASIANPAINT.NS": "CONSUMER", "HAVELLS.NS":    "CONSUMER",
+    "PIDILITIND.NS": "CONSUMER", "VOLTAS.NS":     "CONSUMER", "BERGEPAINT.NS": "CONSUMER",
+    "DMART.NS":      "CONSUMER",
+
+    # REALTY
+    "DLF.NS":        "REALTY", "GODREJPROP.NS": "REALTY", "OBEROIRLTY.NS": "REALTY",
+
+    # TELECOM
+    "BHARTIARTL.NS": "TELECOM",
+
+    # HEALTHCARE
+    "APOLLOHOSP.NS": "HEALTHCARE",
+
+    # CONSUMER INTERNET
+    "ZOMATO.NS":     "INTERNET", "IRCTC.NS":      "INTERNET",
+
+    # OTHERS
+    "PIIND.NS":      "CHEMICALS", "ADANIENT.NS":   "CONGLOMERATE",
+}
+
+# Sector ETF/Index tickers for momentum check
+SECTOR_ETFS = {
+    "IT":       "^CNXIT",       # Nifty IT
+    "BANK":     "^NSEBANK",     # Bank Nifty
+    "PHARMA":   "^CNXPHARMA",   # Nifty Pharma
+    "AUTO":     "^CNXAUTO",     # Nifty Auto
+    "METALS":   "^CNXMETAL",    # Nifty Metal
+    "FMCG":     "^CNXFMCG",     # Nifty FMCG
+    "FINSERV":  "^CNXFINANCE",  # Nifty Financial Services
+    "INFRA":    "^CNXINFRA",    # Nifty Infra
+    "OILGAS":   "^CNXENERGY",   # Nifty Energy
+    "REALTY":   "^CNXREALTY",   # Nifty Realty
+}
+
 # ──────────────────────────────────────────────
 # DATA FETCHING
 # ──────────────────────────────────────────────
@@ -80,6 +162,43 @@ def fetch_data(ticker: str, period: str = "1y"):
         return df
     except Exception:
         return None
+
+
+def get_sector_momentum(sector: str) -> str:
+    """
+    Checks sector index momentum using EMA alignment.
+    Returns BULLISH, BEARISH, or NEUTRAL.
+    Cached per run — fetched once per sector, not per stock.
+    """
+    etf = SECTOR_ETFS.get(sector)
+    if not etf:
+        return "NEUTRAL"  # unknown sector — don't block
+    try:
+        df = yf.download(etf, period="3mo", interval="1d",
+                         progress=False, auto_adjust=True)
+        if df is None or len(df) < 30:
+            return "NEUTRAL"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        close = df["Close"].astype(float)
+        price = float(close.iloc[-1])
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        if price > ema20 > ema50:
+            return "BULLISH"
+        elif price < ema20 and price < ema50:
+            return "BEARISH"
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+# Cache sector momentum so we don't re-fetch for every stock in same sector
+_sector_cache: dict = {}
+
+def get_sector_momentum_cached(sector: str) -> str:
+    if sector not in _sector_cache:
+        _sector_cache[sector] = get_sector_momentum(sector)
+    return _sector_cache[sector]
 
 # ──────────────────────────────────────────────
 # FII/DII SENTIMENT — fetch from NSE
@@ -339,6 +458,201 @@ def calc_vol_spike(vol: pd.Series) -> float:
     return round(float(vol.iloc[-1] / avg), 2) if avg > 0 else 1.0
 
 
+
+def detect_candlestick_patterns(df: pd.DataFrame) -> dict:
+    """
+    Detects 7 key candlestick patterns on the last 3 candles.
+    Returns dict with detected patterns and overall bias (BULLISH/BEARISH/NEUTRAL).
+    
+    Patterns:
+      Bullish: Hammer, Bullish Engulfing, Morning Star
+      Bearish: Shooting Star, Bearish Engulfing, Evening Star
+      Neutral: Doji (used as filter only)
+    """
+    o = df["Open"].values
+    h = df["High"].values
+    l = df["Low"].values
+    c = df["Close"].values
+
+    if len(df) < 3:
+        return {"patterns": [], "bias": "NEUTRAL"}
+
+    # Last 3 candles
+    o1, h1, l1, c1 = o[-3], h[-3], l[-3], c[-3]  # 3 days ago
+    o2, h2, l2, c2 = o[-2], h[-2], l[-2], c[-2]  # yesterday
+    o3, h3, l3, c3 = o[-1], h[-1], l[-1], c[-1]  # today (latest)
+
+    patterns = []
+
+    # ── Helpers ─────────────────────────────────
+    def body(op, cl):     return abs(cl - op)
+    def upper_wick(op, cl, hi): return hi - max(op, cl)
+    def lower_wick(op, cl, lo): return min(op, cl) - lo
+    def is_bullish(op, cl): return cl > op
+    def is_bearish(op, cl): return cl < op
+
+    body3 = body(o3, c3)
+    body2 = body(o2, c2)
+    body1 = body(o1, c1)
+    uw3   = upper_wick(o3, c3, h3)
+    lw3   = lower_wick(o3, c3, l3)
+    uw2   = upper_wick(o2, c2, h2)
+    lw2   = lower_wick(o2, c2, l2)
+    rng3  = h3 - l3  # full candle range
+
+    # ── HAMMER (Bullish reversal) ────────────────
+    # Small body near top, long lower wick >= 2x body, little upper wick
+    if (body3 > 0 and
+        lw3 >= 2 * body3 and
+        uw3 <= 0.3 * body3 and
+        rng3 > 0):
+        patterns.append("Hammer")
+
+    # ── SHOOTING STAR (Bearish reversal) ─────────
+    # Small body near bottom, long upper wick >= 2x body, little lower wick
+    if (body3 > 0 and
+        uw3 >= 2 * body3 and
+        lw3 <= 0.3 * body3 and
+        rng3 > 0):
+        patterns.append("Shooting Star")
+
+    # ── DOJI (Indecision) ────────────────────────
+    # Very small body relative to range
+    if rng3 > 0 and body3 <= 0.1 * rng3:
+        patterns.append("Doji")
+
+    # ── BULLISH ENGULFING ────────────────────────
+    # Today bullish candle completely engulfs yesterday bearish candle
+    if (is_bearish(o2, c2) and
+        is_bullish(o3, c3) and
+        o3 <= c2 and
+        c3 >= o2 and
+        body3 > body2):
+        patterns.append("Bullish Engulfing")
+
+    # ── BEARISH ENGULFING ────────────────────────
+    # Today bearish candle completely engulfs yesterday bullish candle
+    if (is_bullish(o2, c2) and
+        is_bearish(o3, c3) and
+        o3 >= c2 and
+        c3 <= o2 and
+        body3 > body2):
+        patterns.append("Bearish Engulfing")
+
+    # ── MORNING STAR (Strong bullish reversal) ───
+    # Day1: big bearish, Day2: small body (star), Day3: big bullish
+    if (is_bearish(o1, c1) and
+        body1 > 0 and
+        body2 <= 0.3 * body1 and       # small star
+        is_bullish(o3, c3) and
+        c3 >= (o1 + c1) / 2):           # closes above midpoint of day1
+        patterns.append("Morning Star")
+
+    # ── EVENING STAR (Strong bearish reversal) ───
+    # Day1: big bullish, Day2: small body (star), Day3: big bearish
+    if (is_bullish(o1, c1) and
+        body1 > 0 and
+        body2 <= 0.3 * body1 and       # small star
+        is_bearish(o3, c3) and
+        c3 <= (o1 + c1) / 2):           # closes below midpoint of day1
+        patterns.append("Evening Star")
+
+    # ── Determine overall bias ───────────────────
+    bullish_patterns = {"Hammer", "Bullish Engulfing", "Morning Star"}
+    bearish_patterns = {"Shooting Star", "Bearish Engulfing", "Evening Star"}
+
+    bull_count = sum(1 for p in patterns if p in bullish_patterns)
+    bear_count = sum(1 for p in patterns if p in bearish_patterns)
+
+    if bull_count > bear_count:
+        bias = "BULLISH"
+    elif bear_count > bull_count:
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
+
+    return {"patterns": patterns, "bias": bias}
+
+
+
+def check_earnings_soon(ticker: str, days_ahead: int = 3) -> bool:
+    """
+    Returns True if earnings are expected within next N days.
+    Uses yfinance calendar data.
+    Avoids trading 1-2 days before results — gap risk is extreme.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        cal   = stock.calendar
+        if cal is None:
+            return False
+        # calendar can be a dict or DataFrame depending on yfinance version
+        if isinstance(cal, dict):
+            earnings_date = cal.get("Earnings Date")
+            if earnings_date is None:
+                return False
+            if isinstance(earnings_date, list):
+                earnings_date = earnings_date[0]
+        elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+            earnings_date = cal["Earnings Date"].iloc[0]
+        else:
+            return False
+
+        if earnings_date is None:
+            return False
+
+        # Convert to date
+        from datetime import date
+        if hasattr(earnings_date, "date"):
+            ed = earnings_date.date()
+        else:
+            ed = pd.Timestamp(earnings_date).date()
+
+        today = date.today()
+        delta = (ed - today).days
+        return 0 <= delta <= days_ahead
+
+    except Exception:
+        return False
+
+def calc_support_resistance(df: pd.DataFrame, lookback: int = 60) -> dict:
+    """
+    Finds key support and resistance levels using recent swing highs/lows.
+    A swing high = candle whose high is higher than 2 candles on each side.
+    A swing low  = candle whose low  is lower  than 2 candles on each side.
+    Returns nearest resistance above price and nearest support below price.
+    """
+    highs  = df["High"].values[-lookback:]
+    lows   = df["Low"].values[-lookback:]
+    closes = df["Close"].values[-lookback:]
+    price  = float(closes[-1])
+
+    swing_highs = []
+    swing_lows  = []
+
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and            highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            swing_highs.append(highs[i])
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and            lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            swing_lows.append(lows[i])
+
+    # Nearest resistance above current price
+    resistances = [h for h in swing_highs if h > price * 1.001]
+    nearest_resistance = round(float(min(resistances)), 2) if resistances else None
+
+    # Nearest support below current price
+    supports = [l for l in swing_lows if l < price * 0.999]
+    nearest_support = round(float(max(supports)), 2) if supports else None
+
+    # Distance to resistance as % from current price
+    dist_to_resistance = round((nearest_resistance - price) / price * 100, 2) if nearest_resistance else None
+
+    return {
+        "resistance":      nearest_resistance,
+        "support":         nearest_support,
+        "dist_resistance": dist_to_resistance,  # % away from price
+    }
+
 def calc_gap_risk(df: pd.DataFrame, lookback: int = 20) -> dict:
     """
     Calculates overnight gap risk based on last N days of gap history.
@@ -363,11 +677,122 @@ def calc_gap_risk(df: pd.DataFrame, lookback: int = 20) -> dict:
         risk = "LOW"
     return {"avg_gap": avg_gap, "max_gap": max_gap, "risk": risk}
 
+
+# ──────────────────────────────────────────────
+# CANDLESTICK PATTERN DETECTION
+# ──────────────────────────────────────────────
+def detect_candle_patterns(df: pd.DataFrame) -> dict:
+    """
+    Detects 8 high-reliability candlestick patterns on daily data.
+    Bullish: Hammer, Bullish Engulfing, Morning Star, Three White Soldiers
+    Bearish: Shooting Star, Bearish Engulfing, Evening Star, Three Black Crows
+    Returns dict with detected patterns and direction (+1 bullish, -1 bearish, 0 none)
+    """
+    o = df["Open"].values
+    h = df["High"].values
+    l = df["Low"].values
+    c = df["Close"].values
+
+    if len(c) < 3:
+        return {"patterns": [], "bias": 0}
+
+    patterns = []
+    i = len(c) - 1  # latest candle index
+
+    body       = lambda idx: abs(c[idx] - o[idx])
+    upper_wick = lambda idx: h[idx] - max(c[idx], o[idx])
+    lower_wick = lambda idx: min(c[idx], o[idx]) - l[idx]
+    is_green   = lambda idx: c[idx] > o[idx]
+    is_red     = lambda idx: c[idx] < o[idx]
+    candle_range = lambda idx: h[idx] - l[idx]
+
+    # ── BULLISH PATTERNS ───────────────────────
+
+    # 1. Hammer — small body at top, long lower wick >= 2x body, little upper wick
+    if (body(i) > 0 and
+        lower_wick(i) >= 2 * body(i) and
+        upper_wick(i) <= 0.3 * body(i) and
+        candle_range(i) > 0):
+        patterns.append("Hammer 🔨")
+
+    # 2. Bullish Engulfing — red candle followed by green that fully engulfs it
+    if (i >= 1 and
+        is_red(i-1) and is_green(i) and
+        o[i] <= c[i-1] and
+        c[i] >= o[i-1] and
+        body(i) > body(i-1)):
+        patterns.append("Bullish Engulfing 📈")
+
+    # 3. Morning Star — red candle, small body (doji-like), then strong green
+    if (i >= 2 and
+        is_red(i-2) and
+        body(i-1) <= 0.3 * body(i-2) and  # small middle candle
+        is_green(i) and
+        c[i] > (o[i-2] + c[i-2]) / 2):    # green closes above midpoint of first red
+        patterns.append("Morning Star ⭐")
+
+    # 4. Three White Soldiers — 3 consecutive green candles, each closing higher
+    if (i >= 2 and
+        is_green(i) and is_green(i-1) and is_green(i-2) and
+        c[i] > c[i-1] > c[i-2] and
+        o[i] > o[i-1] > o[i-2] and
+        body(i) > 0 and body(i-1) > 0 and body(i-2) > 0):
+        patterns.append("Three White Soldiers 💪")
+
+    # ── BEARISH PATTERNS ───────────────────────
+
+    # 5. Shooting Star — small body at bottom, long upper wick >= 2x body
+    if (body(i) > 0 and
+        upper_wick(i) >= 2 * body(i) and
+        lower_wick(i) <= 0.3 * body(i) and
+        candle_range(i) > 0):
+        patterns.append("Shooting Star 🌠")
+
+    # 6. Bearish Engulfing — green candle followed by red that fully engulfs it
+    if (i >= 1 and
+        is_green(i-1) and is_red(i) and
+        o[i] >= c[i-1] and
+        c[i] <= o[i-1] and
+        body(i) > body(i-1)):
+        patterns.append("Bearish Engulfing 📉")
+
+    # 7. Evening Star — green candle, small body, then strong red
+    if (i >= 2 and
+        is_green(i-2) and
+        body(i-1) <= 0.3 * body(i-2) and
+        is_red(i) and
+        c[i] < (o[i-2] + c[i-2]) / 2):
+        patterns.append("Evening Star 🌆")
+
+    # 8. Three Black Crows — 3 consecutive red candles, each closing lower
+    if (i >= 2 and
+        is_red(i) and is_red(i-1) and is_red(i-2) and
+        c[i] < c[i-1] < c[i-2] and
+        o[i] < o[i-1] < o[i-2] and
+        body(i) > 0 and body(i-1) > 0 and body(i-2) > 0):
+        patterns.append("Three Black Crows 🦅")
+
+    # ── Determine overall bias ─────────────────
+    bullish_patterns = ["Hammer 🔨", "Bullish Engulfing 📈", "Morning Star ⭐", "Three White Soldiers 💪"]
+    bearish_patterns = ["Shooting Star 🌠", "Bearish Engulfing 📉", "Evening Star 🌆", "Three Black Crows 🦅"]
+
+    bull_count = sum(1 for p in patterns if p in bullish_patterns)
+    bear_count = sum(1 for p in patterns if p in bearish_patterns)
+
+    if bull_count > bear_count:
+        bias = 1
+    elif bear_count > bull_count:
+        bias = -1
+    else:
+        bias = 0
+
+    return {"patterns": patterns, "bias": bias, "bull": bull_count, "bear": bear_count}
+
 # ──────────────────────────────────────────────
 # ANALYSIS ENGINE v4
 # ──────────────────────────────────────────────
 def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
-            fii_sentiment: str, vix: float) -> dict | None:
+            fii_sentiment: str, vix: float, adx_val: float = 0.0) -> dict | None:
 
     close  = df["Close"]
     volume = df["Volume"]
@@ -383,7 +808,7 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
 
     # ── Core indicators ─────────────────────────
     rsi_val   = calc_rsi(close)
-    adx_val   = calc_adx(df)
+    # adx_val passed in from main() — no duplicate calculation
     st_dir    = calc_supertrend(df)       # +1 = bullish, -1 = bearish
     macd_val, sig_val, hist = calc_macd(close)
     ema8      = calc_ema(close, 8)
@@ -392,7 +817,13 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
     ema200    = calc_ema(close, min(200, len(close)-1))
     vspike    = calc_vol_spike(volume)
 
-    gap_info  = calc_gap_risk(df)
+    gap_info      = calc_gap_risk(df)
+    sr_info       = calc_support_resistance(df)
+    earnings_soon = check_earnings_soon(ticker)
+    sector        = SECTOR_MAP.get(ticker, "OTHER")
+    sector_mood   = get_sector_momentum_cached(sector)
+    candle    = detect_candlestick_patterns(df)
+    candles   = detect_candle_patterns(df)
     pct_200   = round((price - ema200) / ema200 * 100, 2)
     above_200 = price > ema200
     deep_down = pct_200 < -15
@@ -410,7 +841,39 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
     if vspike < 0.9:
         return None  # dead volume
 
-    # GATE 3 - Hard RSI gate (mandatory, not optional)
+    # GATE 3 - Sector momentum gate
+    # Don't BUY a stock in a bearish sector — swimming against the tide
+    # Don't SHORT a stock in a bullish sector
+    # Exception: if sector is NEUTRAL, allow both
+    is_likely_buy   = above_200 and st_dir == 1
+    is_likely_short = not above_200 and st_dir == -1
+
+    if is_likely_buy and sector_mood == "BEARISH":
+        return None  # whole sector is weak — individual BUY unlikely to work
+
+    if is_likely_short and sector_mood == "BULLISH":
+        return None  # whole sector is strong — individual SHORT unlikely to work
+
+    # GATE 4 - Earnings gate
+    # Never trade 1-3 days before earnings — extreme gap risk
+    if earnings_soon:
+        return None  # earnings coming up — skip regardless of signal
+
+    # GATE 5 - Candlestick pattern gate
+    # If a strong bearish pattern forms today, block BUY
+    # If a strong bullish pattern forms today, block SHORT
+    # Doji = indecision = reduce confidence but don't block
+    strong_bearish_candles = {"Bearish Engulfing", "Evening Star", "Shooting Star"}
+    strong_bullish_candles = {"Bullish Engulfing", "Morning Star", "Hammer"}
+    candle_patterns = set(candle["patterns"])
+
+    if any(p in strong_bearish_candles for p in candle_patterns) and above_200:
+        return None  # bearish candle on a BUY candidate — contradicts signal
+
+    if any(p in strong_bullish_candles for p in candle_patterns) and not above_200:
+        return None  # bullish candle on a SHORT candidate — contradicts signal
+
+    # GATE 6 - Hard RSI gate (mandatory, not optional)
     # RSI must be in valid zone - no exceptions
     is_potential_buy   = above_200 and (st_dir == 1 or ema8 > ema21)
     is_potential_short = not above_200 and (st_dir == -1 or ema8 < ema21)
@@ -462,14 +925,30 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
         # Market-level suppression
         if market_mood == "BEARISH" and fii_sentiment == "FII_BEARISH":
             return None  # don't fight both market and FIIs
+        # Candlestick confirmation
+        if candles["bias"] == -1:
+            return None  # bearish candle pattern on a BUY setup — skip
+        if candles["patterns"]:
+            reasons.append(f"Candle: {', '.join(candles['patterns'])}")
+        if candle["bias"] == "BULLISH":       reasons.append(f"Candle: {', '.join(candle['patterns'])}")
         if buy_conditions["above_200ema"]:   reasons.append(f"Above 200 EMA (+{pct_200}%)")
         if buy_conditions["supertrend_bull"]: reasons.append("SuperTrend bullish")
         if buy_conditions["ema_crossover"]:   reasons.append("EMA 8 > 21 > 55 aligned")
         if buy_conditions["macd_bull"]:       reasons.append("MACD bullish crossover")
         if buy_conditions["rsi_pullback"]:    reasons.append(f"RSI pullback in uptrend ({rsi_val})")
         if vspike >= 1.5:                     reasons.append(f"Volume spike {vspike}x")
+        # Dynamic target based on signal strength
+        if buy_score == 6:   profit_pct = 2.0
+        elif buy_score == 5: profit_pct = 1.5
+        else:                profit_pct = 1.0
+
+        # S/R check — block BUY if resistance wall is closer than target
+        if sr_info["dist_resistance"] is not None:
+            if sr_info["dist_resistance"] < profit_pct:
+                return None  # resistance wall before target — skip
+
         signal = "BUY"
-        target = round(price * (1 + MIN_PROFIT_PCT / 100), 2)
+        target = round(price * (1 + profit_pct / 100), 2)
         sl     = round(price * (1 - STOP_LOSS_PCT / 100), 2)
         score  = buy_score
 
@@ -477,6 +956,12 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
         # Market-level suppression
         if market_mood == "BULLISH" and fii_sentiment == "FII_BULLISH":
             return None  # don't short a strong bull market
+        # Candlestick confirmation
+        if candles["bias"] == 1:
+            return None  # bullish candle pattern on a SHORT setup — skip
+        if candles["patterns"]:
+            reasons.append(f"Candle: {', '.join(candles['patterns'])}")
+        if candle["bias"] == "BEARISH":         reasons.append(f"Candle: {', '.join(candle['patterns'])}")
         if short_conditions["below_200ema"]:   reasons.append(f"Below 200 EMA ({pct_200}%)")
         if short_conditions["supertrend_bear"]: reasons.append("SuperTrend bearish")
         if short_conditions["ema_crossover"]:   reasons.append("EMA 8 < 21 < 55 aligned")
@@ -484,7 +969,11 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
         if short_conditions["rsi_zone"]:        reasons.append(f"RSI in short zone ({rsi_val})")
         if vspike >= 1.5:                       reasons.append(f"Volume spike {vspike}x")
         signal = "SHORT"
-        target = round(price * (1 - MIN_PROFIT_PCT / 100), 2)
+        # Dynamic target based on signal strength
+        if short_score == 6:   profit_pct = 2.0
+        elif short_score == 5: profit_pct = 1.5
+        else:                  profit_pct = 1.0
+        target = round(price * (1 - profit_pct / 100), 2)
         sl     = round(price * (1 + STOP_LOSS_PCT / 100), 2)
         score  = short_score
 
@@ -504,6 +993,7 @@ def analyse(ticker: str, df: pd.DataFrame, market_mood: str,
         "day_chg": day_chg,
         "vs200":   pct_200,
         "gap":     gap_info,
+        "candles": candles["patterns"],
         "reasons": reasons,
     }
 
@@ -555,9 +1045,10 @@ def build_message(results: list, market_mood: str,
             lines.append(
                 f"\n<b>{esc(r['symbol'])}</b>  ({r['score']}/6 conditions met)\n"
                 f"  💰 Entry: ₹{r['price']}\n"
-                f"  🎯 Target: ₹{r['target']}  (+1%)\n"
+                f"  🎯 Target: ₹{r['target']}  (+{r.get('profit_pct', 1.0)}%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (-0.5%)\n"
                 f"  📊 RSI: {r['rsi']}  |  ADX: {r['adx']}  |  Vol: {r['vol']}x\n"
+                f"  🏭 Sector: {esc(r['sector'])} ({esc(r['sector_mood'])})\n"
                 f"  ⚡ Gap Risk: {r['gap']['risk']}  (avg {r['gap']['avg_gap']}%, max {r['gap']['max_gap']}%)\n"
                 f"  📝 {reasons_str}"
             )
@@ -569,9 +1060,10 @@ def build_message(results: list, market_mood: str,
             lines.append(
                 f"\n<b>{esc(r['symbol'])}</b>  ({r['score']}/6 conditions met)\n"
                 f"  💰 Entry: ₹{r['price']}\n"
-                f"  🎯 Target: ₹{r['target']}  (-1%)\n"
+                f"  🎯 Target: ₹{r['target']}  (-{r.get('profit_pct', 1.0)}%)\n"
                 f"  🛑 Stop Loss: ₹{r['sl']}  (+0.5%)\n"
                 f"  📊 RSI: {r['rsi']}  |  ADX: {r['adx']}  |  Vol: {r['vol']}x\n"
+                f"  🏭 Sector: {esc(r['sector'])} ({esc(r['sector_mood'])})\n"
                 f"  ⚡ Gap Risk: {r['gap']['risk']}  (avg {r['gap']['avg_gap']}%, max {r['gap']['max_gap']}%)\n"
                 f"  📝 {reasons_str}\n"
                 f"  📦 Instrument: Futures or Put Option"
@@ -627,7 +1119,7 @@ def main():
             if adx_quick < ADX_THRESHOLD:
                 skipped_adx += 1
             else:
-                rec = analyse(ticker, df, market_mood, fii_data["sentiment"], vix)
+                rec = analyse(ticker, df, market_mood, fii_data["sentiment"], vix, adx_val=adx_quick)
                 if rec:
                     results.append(rec)
         if (i + 1) % 20 == 0:
